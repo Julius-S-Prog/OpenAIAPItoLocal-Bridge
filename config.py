@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     llama_cpp_api_path: str = "/v1/chat/completions"
     default_model: str = "local"
     temperature: float = 0.7
-    max_tokens: int = 2048
+    max_tokens: int = 8192
     top_p: float = 0.95
     stream: bool = False
 
