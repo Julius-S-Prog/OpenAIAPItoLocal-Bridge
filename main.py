@@ -38,10 +38,14 @@ async def list_models():
 async def chat_completions(request: Request):
     try:
         body = await request.json()
+        # ---- DEBUG ----
+        print("👉 Incoming OpenAI request JSON:", json.dumps(body, indent=2))
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     openai_req = ChatCompletionRequest(**body)
+        # ---- DEBUG ----
+    print("✅ Parsed request:", openai_req)
     llama_req = build_llama_request(openai_req)
     stream = llama_req.stream or settings.stream
 
@@ -55,12 +59,20 @@ async def chat_completions(request: Request):
 
 
 async def non_stream_response(llama_req, model_name: str):
-    async with httpx.AsyncClient(timeout=120.0) as client:
+     # ---- DEBUG ----
+    print("📤 Sending to llama.cpp (non‑stream):",
+          json.dumps(llama_req.model_dump(exclude_none=True), indent=2))
+
+    async with httpx.AsyncClient(timeout=240.0) as client:
         resp = await client.post(
             settings.completions_url,
             json=llama_req.model_dump(exclude_none=True),
             headers={"Content-Type": "application/json"},
         )
+         # ---- DEBUG ----
+        print("📥 Received from llama.cpp (status", resp.status_code, "):")
+        print(resp.text)                     # raw JSON string
+        data = resp.json()
 
     if resp.status_code != 200:
         raise HTTPException(
@@ -104,6 +116,10 @@ async def non_stream_response(llama_req, model_name: str):
 async def stream_response(llama_req, model_name: str):
     llama_req.stream = True
     chunk_id = f"chatcmpl-{uuid.uuid4()}"
+
+    # ---- DEBUG ----
+    print("📤 Sending to llama.cpp (stream):",
+          json.dumps(llama_req.model_dump(exclude_none=True), indent=2))
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         async with client.stream(
