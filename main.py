@@ -2,34 +2,24 @@ import uuid
 import time
 import json
 import httpx
+import logging
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 from config import settings
-from models import (
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    ChatCompletionChunk,
-    Choice,
-    ChoiceDelta,
-    Message,
-    Usage,
-)
-from converter import build_llama_request
 
-app = FastAPI(title="OpenAI to llama.cpp Bridge")
+logging.basicConfig(level=logging.INFO, format="%(levelname)-7s | %(message)s")
+logger = logging.getLogger("bridge")
+
+app = FastAPI(title="OpenAI → llama.cpp Bridge")
 
 
 @app.get("/v1/models")
 async def list_models():
     return {
         "data": [
-            {
-                "id": settings.default_model,
-                "object": "model",
-                "owned_by": "bridge",
-            }
+            {"id": settings.default_model, "object": "model", "owned_by": "bridge"}
         ]
     }
 
@@ -38,99 +28,134 @@ async def list_models():
 async def chat_completions(request: Request):
     try:
         body = await request.json()
-        # ---- DEBUG ----
-        print("👉 Incoming OpenAI request JSON:", json.dumps(body, indent=2))
     except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        raise HTTPException(400, "Invalid JSON")
 
-    openai_req = ChatCompletionRequest(**body)
-        # ---- DEBUG ----
-    print("✅ Parsed request:", openai_req)
-    llama_req = build_llama_request(openai_req)
-    stream = llama_req.stream or settings.stream
+    messages = body.get("messages", [])
+    model_name = body.get("model", settings.default_model)
 
-    if stream:
+    # ── log incoming request ──────────────────────────────────
+    logger.info("=" * 70)
+    logger.info("📥 CLIENT → BRIDGE")
+    logger.info(f"   model    : {model_name}")
+    logger.info(f"   messages : {len(messages)}")
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "?")
+        text = msg.get("content", "")
+        logger.info(f"   msg[{i}] : role={role}, len={len(text)}")
+        preview = text[:300] if len(text) > 300 else text
+        logger.info(f"            preview: {repr(preview)}")
+    logger.info("=" * 70)
+
+    # ── build llama.cpp payload (pass messages through verbatim) ─
+    llama_body: dict = {"messages": messages}
+
+    for src, dst in [
+        ("temperature", "temperature"),
+        ("max_tokens", "n_predict"),
+        ("top_p", "top_p"),
+        ("stop", "stop"),
+        ("frequency_penalty", "frequency_penalty"),
+        ("presence_penalty", "presence_penalty"),
+    ]:
+        if src in body:
+            llama_body[dst] = body[src]
+
+    llama_body.setdefault("temperature", settings.temperature)
+    llama_body.setdefault("n_predict", settings.max_tokens)
+    llama_body.setdefault("top_p", settings.top_p)
+    llama_body.setdefault("stream", settings.stream)
+
+    # ── log outgoing request ──────────────────────────────────
+    logger.info("=" * 70)
+    logger.info(f"📤 BRIDGE → LLAMA.CPP ({settings.completions_url})")
+    logger.info(f"   stream: {llama_body['stream']}")
+    logger.info(f"   payload:\n{json.dumps(llama_body, ensure_ascii=False, indent=2)}")
+    logger.info("=" * 70)
+
+    if llama_body["stream"]:
         return StreamingResponse(
-            stream_response(llama_req, openai_req.model),
+            _stream(llama_body, model_name),
             media_type="text/event-stream",
         )
-    else:
-        return await non_stream_response(llama_req, openai_req.model)
+    return await _non_stream(llama_body, model_name)
 
 
-async def non_stream_response(llama_req, model_name: str):
-     # ---- DEBUG ----
-    print("📤 Sending to llama.cpp (non‑stream):",
-          json.dumps(llama_req.model_dump(exclude_none=True), indent=2))
-
+# ── non-streaming ──────────────────────────────────────────────
+async def _non_stream(llama_body: dict, model_name: str):
     async with httpx.AsyncClient(timeout=240.0) as client:
         resp = await client.post(
             settings.completions_url,
-            json=llama_req.model_dump(exclude_none=True),
+            json=llama_body,
             headers={"Content-Type": "application/json"},
         )
-         # ---- DEBUG ----
-        print("📥 Received from llama.cpp (status", resp.status_code, "):")
-        print(resp.text)                     # raw JSON string
-        data = resp.json()
 
     if resp.status_code != 200:
-        raise HTTPException(
-            status_code=resp.status_code,
-            detail=resp.text,
-        )
+        logger.error(f"llama.cpp HTTP {resp.status_code}: {resp.text[:1000]}")
+        raise HTTPException(resp.status_code, resp.text)
 
     data = resp.json()
 
+    # ── log llama.cpp raw response ────────────────────────────
+    logger.info("=" * 70)
+    logger.info("📥 LLAMA.CPP → BRIDGE")
+    raw_out = json.dumps(data, ensure_ascii=False)
+    if len(raw_out) > 2000:
+        logger.info(f"   raw ({len(raw_out)} chars): {raw_out[:2000]}...")
+    else:
+        logger.info(f"   raw: {raw_out}")
+    logger.info("=" * 70)
+
     choices = data.get("choices", [])
     if not choices:
-        raise HTTPException(status_code=502, detail="No choices in llama.cpp response")
+        raise HTTPException(502, "No choices in llama.cpp response")
 
-    message = choices[0].get("message", {})
-    content = message.get("content", "")
-
+    msg = choices[0].get("message", {})
+    content = msg.get("content", "")
     usage = data.get("usage", {})
-    prompt_tokens = usage.get("prompt_tokens", 0)
-    completion_tokens = usage.get("completion_tokens", 0)
-    finish_reason = choices[0].get("finish_reason", "stop")
 
-    return ChatCompletionResponse(
-        id=data.get("id", f"chatcmpl-{uuid.uuid4()}"),
-        model=model_name,
-        choices=[
-            Choice(
-                index=choices[0].get("index", 0),
-                message=Message(role="assistant", content=content),
-                finish_reason=finish_reason,
-            )
-        ],
-        usage=Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=usage.get("total_tokens", prompt_tokens + completion_tokens),
-        ),
-        created=data.get("created", int(time.time())),
-    )
+    response = {
+        "id": data.get("id", f"chatcmpl-{uuid.uuid4()}"),
+        "object": "chat.completion",
+        "model": model_name,
+        "choices": [{
+            "index": choices[0].get("index", 0),
+            "message": {"role": msg.get("role", "assistant"), "content": content},
+            "finish_reason": choices[0].get("finish_reason", "stop"),
+        }],
+        "usage": {
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+        "created": data.get("created", int(time.time())),
+    }
+
+    # ── log outgoing response ─────────────────────────────────
+    logger.info("=" * 70)
+    logger.info("📤 BRIDGE → CLIENT")
+    logger.info(f"   content len : {len(content)}")
+    preview = content[:300] if len(content) > 300 else content
+    logger.info(f"   preview     : {repr(preview)}")
+    logger.info("=" * 70)
+
+    return response
 
 
-async def stream_response(llama_req, model_name: str):
-    llama_req.stream = True
+# ── streaming ──────────────────────────────────────────────────
+async def _stream(llama_body: dict, model_name: str):
     chunk_id = f"chatcmpl-{uuid.uuid4()}"
+    llama_body["stream"] = True
+    full = ""
 
-    # ---- DEBUG ----
-    print("📤 Sending to llama.cpp (stream):",
-          json.dumps(llama_req.model_dump(exclude_none=True), indent=2))
-
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=240.0) as client:
         async with client.stream(
-            "POST",
-            settings.completions_url,
-            json=llama_req.model_dump(exclude_none=True),
-            headers={"Content-Type": "application/json"},
+            "POST", settings.completions_url, json=llama_body,
         ) as resp:
             if resp.status_code != 200:
-                error_text = await resp.aread()
-                yield f"data: {json.dumps({'error': error_text.decode()})}\n\n"
+                err = (await resp.aread()).decode()
+                logger.error(f"stream HTTP {resp.status_code}: {err[:1000]}")
+                yield f"data: {json.dumps({'error': err})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
 
@@ -140,43 +165,36 @@ async def stream_response(llama_req, model_name: str):
                     continue
                 if line.startswith("data: "):
                     line = line[6:]
-
                 try:
-                    chunk_data = json.loads(line)
+                    chunk = json.loads(line)
                 except json.JSONDecodeError:
                     continue
 
-                choices = chunk_data.get("choices", [])
-                if not choices:
-                    continue
+                deltas = chunk.get("choices", [{}])[0].get("delta", {})
+                text = deltas.get("content", "")
+                full += text
 
-                delta = choices[0].get("delta", {})
-                content = delta.get("content", "")
-                if content:
-                    chunk = ChatCompletionChunk(
-                        id=chunk_id,
-                        model=model_name,
-                        created=int(time.time()),
-                        choices=[
-                            Choice(
-                                index=0,
-                                delta=ChoiceDelta(role="assistant", content=content),
-                            )
-                        ],
-                    )
-                    yield f"data: {chunk.model_dump_json()}\n\n"
+                if text:
+                    chunk_json = json.dumps({
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "model": model_name,
+                        "created": int(time.time()),
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": text},
+                        }],
+                    })
+                    yield "data: " + chunk_json + "\n\n"
 
-    done_chunk = ChatCompletionChunk(
-        id=chunk_id,
-        model=model_name,
-        created=int(time.time()),
-        choices=[
-            Choice(
-                index=0,
-                delta=ChoiceDelta(),
-                finish_reason="stop",
-            )
-        ],
-    )
-    yield f"data: {done_chunk.model_dump_json()}\n\n"
+    done_json = json.dumps({
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "model": model_name,
+        "created": int(time.time()),
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    })
+    yield "data: " + done_json + "\n\n"
     yield "data: [DONE]\n\n"
+
+    logger.info("[stream] done - accumulated " + str(len(full)) + " chars")
